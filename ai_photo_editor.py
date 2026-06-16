@@ -9,6 +9,7 @@ import json
 import time
 import logging
 import requests
+import base64
 from pathlib import Path
 from PIL import Image, ImageEnhance
 try:
@@ -71,11 +72,29 @@ def validate_input_directory(input_dir: str) -> bool:
     
     return True
 
+def load_raw_image(image_path: str) -> Image.Image:
+    """Load a RAW image and convert it to a PIL Image"""
+    if rawpy is None:
+        logger.error("rawpy library not installed. Cannot load RAW images.")
+        # Fallback to PIL for non-RAW formats if possible
+        return Image.open(image_path)
+    
+    try:
+        with rawpy.imread(image_path) as raw:
+            # postprocess converts RAW to RGB array
+            rgb = raw.postprocess()
+            # Convert numpy array to PIL Image
+            return Image.fromarray(rgb)
+    except Exception as e:
+        logger.error(f"Failed to load RAW image {image_path}: {e}")
+        # Fallback to PIL if it's actually a JPEG/PNG etc.
+        return Image.open(image_path)
+
 def create_preview_image(image_path: str, max_size: tuple = (800, 600)) -> str:
     """Create a lower-res preview of an image for Ollama transmission"""
     try:
-        # Load the image
-        img = Image.open(image_path)
+        # Load the image (handles RAW via load_raw_image)
+        img = load_raw_image(image_path)
         # Create a preview
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
         
@@ -138,15 +157,23 @@ def send_image_to_ollama(image_path: str, prompt: str, model: str, server_url: s
             headers['Authorization'] = f'Bearer {api_key}'
         
         # Prepare payload for Ollama multimodal request
+        with open(preview_path, "rb") as f:
+            img_base64 = base64.b64encode(f.read()).decode('utf-8')
+
         payload = {
             "model": model,
             "prompt": prompt,
-            "images": [preview_path]
+            "images": [img_base64],
+            "stream": False
         }
         
         # In case of API 400 errors, let's try an alternative approach
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         
+        # Clean up preview file if it was created
+        if preview_path != image_path and os.path.exists(preview_path):
+            os.remove(preview_path)
+
         if response.status_code == 400:
             logger.error("Ollama API returned 400 error. This could be due to:\n"
                    "- Incorrect model (check if nemotron3:33b is installed)\n"
@@ -213,7 +240,8 @@ def send_simple_prompt_to_ollama(prompt: str, model: str, server_url: str, api_k
         
         payload = {
             "model": model,
-            "prompt": prompt
+            "prompt": prompt,
+            "stream": False
         }
         
         response = requests.post(url, json=payload, headers=headers, timeout=120)
@@ -265,24 +293,6 @@ def validate_ai_response(response: dict) -> bool:
         if not isinstance(edit, dict) or "type" not in edit or "value" not in edit:
             return False
     return True
-
-def load_raw_image(image_path: str) -> Image.Image:
-    """Load a RAW image and convert it to a PIL Image"""
-    if rawpy is None:
-        logger.error("rawpy library not installed. Cannot load RAW images.")
-        # Fallback to PIL for non-RAW formats if possible
-        return Image.open(image_path)
-    
-    try:
-        with rawpy.imread(image_path) as raw:
-            # postprocess converts RAW to RGB array
-            rgb = raw.postprocess()
-            # Convert numpy array to PIL Image
-            return Image.fromarray(rgb)
-    except Exception as e:
-        logger.error(f"Failed to load RAW image {image_path}: {e}")
-        # Fallback to PIL if it's actually a JPEG/PNG etc.
-        return Image.open(image_path)
 
 def apply_adjustments(img: Image.Image, recommendations: dict) -> Image.Image:
     """Apply AI recommendations to the image using PIL ImageEnhance"""
