@@ -27,16 +27,16 @@ An AI-powered professional RAW photo editor that leverages Large Language Models
    cd image-editor
    ```
 
-2. Install dependencies:
+2. Install using uv:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 ### Usage
 
 Run the editor via the command line:
 ```bash
-python ai_photo_editor.py /path/to/raw/images --output_dir /path/to/output
+uv run ai-photo-editor /path/to/raw/images --output_dir /path/to/output
 ```
 
 ## 🛠️ How it Works
@@ -50,8 +50,7 @@ The pipeline follows these steps:
 ## 📁 Project Structure
 
 - `ai_photo_editor.py`: Main application entry point and core logic.
-- `requirements.txt`: List of required Python packages.
-- `setup.py`: Packaging configuration for installation.
+- `pyproject.toml`: Project configuration and dependency management.
 - `tests/`: Unit tests for validating the image processing and AI response pipelines.
 
 ## ⚙️ Configuration
