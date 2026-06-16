@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.idea/
+.vscode/
+output/
+images/
+*.zip
+.bash*
+.profile
+.zprofile
+.zshrc
+.gitconfig
+.gitmodules
+.mcp.json
+.ripgreprc
+.claude/
