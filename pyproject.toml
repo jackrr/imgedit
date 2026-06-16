@@ -12,6 +12,9 @@ dependencies = [
     "imageio>=2.25.0",
 ]
 
+[tool.setuptools]
+py-modules = ["ai_photo_editor"]
+
 [project.scripts]
 ai-photo-editor = "ai_photo_editor:main"
 
