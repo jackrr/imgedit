@@ -1,0 +1,25 @@
+[project]
+name = "ai-photo-editor"
+version = "0.1.0"
+description = "AI-powered RAW photo editor using Ollama"
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "requests>=2.28.0",
+    "Pillow>=9.0.0",
+    "rawpy>=0.15.0",
+    "numpy>=1.21.0",
+    "imageio>=2.25.0",
+]
+
+[project.scripts]
+ai-photo-editor = "ai_photo_editor:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+]
