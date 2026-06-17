@@ -23,6 +23,10 @@ except ImportError:
 
 
 
+RAW_EXTENSIONS = {'.cr2', '.cr3', '.crw', '.nef', '.orf', '.arw', '.mrw', 
+                  '.raf', '.rw2', '.dng', '.3fr', '.erf', '.kdc', '.mef', 
+                  '.pef', '.sr2', '.srw', '.tiff', '.tif'}
+
 def setup_logging(level=logging.INFO):
     """Configure logging for the application"""
     logging.basicConfig(
@@ -56,13 +60,10 @@ def validate_input_directory(input_dir: str) -> bool:
         return False
     
     # Check for valid RAW image extensions
-    raw_extensions = {'.cr2', '.cr3', '.crw', '.nef', '.orf', '.arw', '.mrw', 
-                      '.raf', '.rw2', '.dng', '.3fr', '.erf', '.kdc', '.mef', 
-                      '.pef', '.sr2', '.srw', '.tiff', '.tif'}
     valid_files = []
     
     for filename in os.listdir(input_dir):
-        if any(filename.lower().endswith(ext) for ext in raw_extensions):
+        if any(filename.lower().endswith(ext) for ext in RAW_EXTENSIONS):
             valid_files.append(filename)
     
     if not valid_files:
@@ -72,29 +73,34 @@ def validate_input_directory(input_dir: str) -> bool:
     
     return True
 
-def load_raw_image(image_path: str) -> Image.Image:
-    """Load a RAW image and convert it to a PIL Image"""
-    if rawpy is None:
-        logger.error("rawpy library not installed. Cannot load RAW images.")
-        # Fallback to PIL for non-RAW formats if possible
-        return Image.open(image_path)
+def load_image(image_path: str) -> Image.Image:
+    """Load an image, using rawpy for RAW formats and PIL for others"""
+    ext = Path(image_path).suffix.lower()
+    
+    if ext in RAW_EXTENSIONS:
+        if rawpy is None:
+            logger.error("rawpy library not installed. Cannot load RAW images.")
+        else:
+            try:
+                with rawpy.imread(image_path) as raw:
+                    # postprocess converts RAW to RGB array
+                    rgb = raw.postprocess()
+                    # Convert numpy array to PIL Image
+                    return Image.fromarray(rgb)
+            except Exception as e:
+                logger.warning(f"rawpy failed to load {image_path}: {e}. Trying PIL fallback...")
     
     try:
-        with rawpy.imread(image_path) as raw:
-            # postprocess converts RAW to RGB array
-            rgb = raw.postprocess()
-            # Convert numpy array to PIL Image
-            return Image.fromarray(rgb)
-    except Exception as e:
-        logger.error(f"Failed to load RAW image {image_path}: {e}")
-        # Fallback to PIL if it's actually a JPEG/PNG etc.
         return Image.open(image_path)
+    except Exception as e:
+        logger.error(f"Failed to load image {image_path}: {e}")
+        raise
 
 def create_preview_image(image_path: str, max_size: tuple = (800, 600)) -> str:
     """Create a lower-res preview of an image for Ollama transmission"""
     try:
-        # Load the image (handles RAW via load_raw_image)
-        img = load_raw_image(image_path)
+        # Load the image (handles RAW via load_image)
+        img = load_image(image_path)
         # Create a preview
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
         
@@ -137,67 +143,118 @@ Format your response as valid JSON:
 """
     return prompt
 
-def send_image_to_ollama(image_path: str, prompt: str, model: str, server_url: str, api_key: str = None) -> dict:
-    """Send image and prompt to Ollama API and get AI recommendations"""
-    try:
-        # Create preview image for transmission  
-        preview_path = create_preview_image(image_path)
-        logger.info(f"Created preview for {image_path}")
-        
-        # Ollama's API format for multimodal models (LLaVA-like)
-        url = f"{server_url}/api/generate"
+def generate_refinement_prompt(previous_recommendations: dict) -> str:
+    """Generate prompt for AI to refine the results of edits"""
+    recs_text = json.dumps(previous_recommendations, indent=2)
+    prompt = f"""
+You are an expert photo editor. You are provided with two images:
+1. The original RAW image.
+2. The edited version resulting from the previous recommendations.
 
+The recommendations that were applied are:
+{recs_text}
+
+Please perform the following:
+1. Provide a professional critique of the edited image. 
+   - Did the edits achieve the intended goal?
+   - Are there any over-corrections or under-corrections?
+2. Provide UPDATED recommendations to "dial in" the final look.
+
+Format your response as valid JSON:
+{{
+    "critique": "Your professional critique of the current result",
+    "recommendations": {{
+        "title": "Updated title for edit series",
+        "description": "Explanation of the refinements made",
+        "edits": [
+            {{
+                "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
+                "value": "numeric or descriptive value",
+                "explanation": "Why this updated value is better"
+            }}
+        ]
+    }}
+}}
+"""
+    return prompt
+
+def generate_critique_prompt(original_recommendations: dict) -> str:
+    """Generate prompt for AI to critique the results of edits"""
+    recs_text = json.dumps(original_recommendations, indent=2)
+    prompt = f"""
+You are an expert photo critic. You are provided with two images: 
+1. The original RAW image.
+2. The edited version based on specific recommendations.
+
+The recommended edits were:
+{recs_text}
+
+Please critique the edited image. 
+- Did the edits achieve the intended goal?
+- Is the image improved? 
+- Are there any over-corrections (e.g., too much saturation, too bright)?
+- What would you further improve?
+
+Provide a detailed, professional critique.
+"""
+    return prompt
+
+def send_images_to_ollama(image_paths: list, prompt: str, model: str, server_url: str, api_key: str = None) -> str:
+    """Send multiple images and a prompt to Ollama API and get the AI response"""
+    try:
+        # Create preview images for all input paths
+        img_base64_list = []
+        preview_files_to_cleanup = []
         
-        headers = {
-            'Content-Type': 'application/json'
-        }
+        for path in image_paths:
+            preview_path = create_preview_image(path)
+            if preview_path != path:
+                preview_files_to_cleanup.append(preview_path)
+            
+            with open(preview_path, "rb") as f:
+                img_base64_list.append(base64.b64encode(f.read()).decode('utf-8'))
         
-        # Add authorization header if available
+        # Ollama's API format for multimodal models
+        url = f"{server_url}/api/generate"
+        headers = {'Content-Type': 'application/json'}
         if api_key:
             headers['Authorization'] = f'Bearer {api_key}'
         
-        # Prepare payload for Ollama multimodal request
-        with open(preview_path, "rb") as f:
-            img_base64 = base64.b64encode(f.read()).decode('utf-8')
-
         payload = {
             "model": model,
             "prompt": prompt,
-            "images": [img_base64],
+            "images": img_base64_list,
             "stream": False
         }
         
-        # In case of API 400 errors, let's try an alternative approach
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         
-        # Clean up preview file if it was created
-        if preview_path != image_path and os.path.exists(preview_path):
-            os.remove(preview_path)
+        # Clean up preview files
+        for p in preview_files_to_cleanup:
+            if os.path.exists(p):
+                os.remove(p)
 
         if response.status_code == 400:
-            logger.error("Ollama API returned 400 error. This could be due to:\n"
-                   "- Incorrect model (check if nemotron3:33b is installed)\n"
-                   "- Invalid multimodal input\n"
-                   "- Missing or incorrect preview image format\n"
-                   "Testing with a simple text-only prompt instead.")
-            
-            # Fallback to simpler text-only request
-            simple_payload = {
-                "model": model,
-                "prompt": prompt
-            }
-            return send_simple_prompt_to_ollama(prompt, model, server_url, api_key)
+            logger.error("Ollama API returned 400 error. Fallback to text-only.")
+            return send_simple_prompt_to_ollama(prompt, model, server_url, api_key).get('response', 'Error: AI failed to respond.')
 
-        
         response.raise_for_status()
+        return response.json().get('response', '')
         
-        data = response.json()
-        generated_text = data.get('response', '')
+    except Exception as e:
+        logger.error(f"Error calling Ollama API for images {image_paths}: {e}")
+        return f"Error during AI processing: {e}"
+
+def send_image_to_ollama(image_path: str, prompt: str, model: str, server_url: str, api_key: str = None) -> dict:
+    """Send image and prompt to Ollama API and get AI recommendations"""
+    try:
+        # Use the generalized function to get the raw response
+        response_text = send_images_to_ollama([image_path], prompt, model, server_url, api_key)
         
         # Try to extract JSON from response
         try:
             import re
-            json_match = re.search(r'\{.*\}', generated_text, re.DOTALL)
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 json_string = json_match.group(0)
                 return json.loads(json_string)
@@ -211,13 +268,6 @@ def send_image_to_ollama(image_path: str, prompt: str, model: str, server_url: s
             "edits": []
         }
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling Ollama API for {image_path}: {e}")
-        return {
-            "title": "AI Recommendation", 
-            "description": "AI-generated edit suggestions",
-            "edits": []
-        }
     except Exception as e:
         logger.error(f"Error processing {image_path}: {e}")
         return {
@@ -317,18 +367,25 @@ def apply_adjustments(img: Image.Image, recommendations: dict) -> Image.Image:
                 numeric_value = float(value)
             
             if edit_type == "exposure":
+                # AI provides offsets like +0.2 or -0.1. Factor = 1.0 + offset.
+                factor = max(0.0, 1.0 + numeric_value)
                 enhancer = ImageEnhance.Brightness(processed_img)
-                processed_img = enhancer.enhance(numeric_value)
+                processed_img = enhancer.enhance(factor)
             elif edit_type == "contrast":
+                # AI provides percentages like +15 or -5. Factor = 1.0 + (perc/100).
+                factor = max(0.0, 1.0 + (numeric_value / 100.0))
                 enhancer = ImageEnhance.Contrast(processed_img)
-                processed_img = enhancer.enhance(numeric_value)
+                processed_img = enhancer.enhance(factor)
             elif edit_type == "saturation":
+                # AI provides percentages like +5 or -5. Factor = 1.0 + (perc/100).
+                factor = max(0.0, 1.0 + (numeric_value / 100.0))
                 enhancer = ImageEnhance.Color(processed_img)
-                processed_img = enhancer.enhance(numeric_value)
+                processed_img = enhancer.enhance(factor)
             elif edit_type == "clarity":
-                # Basic clarity simulation using contrast/sharpness
+                # AI provides percentages like +2 or +10. Factor = 1.0 + (perc/100).
+                factor = max(0.0, 1.0 + (numeric_value / 100.0))
                 enhancer = ImageEnhance.Contrast(processed_img)
-                processed_img = enhancer.enhance(numeric_value)
+                processed_img = enhancer.enhance(factor)
             # Other types (highlights, shadows, white_balance) would require 
             # more complex numpy manipulations on the array.
             
@@ -343,6 +400,50 @@ def save_processed_image(img: Image.Image, output_path: str):
         img.save(output_path, "JPEG", quality=95)
     except Exception as e:
         logger.error(f"Failed to save image to {output_path}: {e}")
+
+def get_ai_critique(original_path: str, edited_path: str, recommendations: dict, config: dict) -> str:
+    """Get a critique from AI about the applied edits"""
+    logger.info(f"  Requesting AI critique for {edited_path}...")
+    prompt = generate_critique_prompt(recommendations)
+    critique = send_images_to_ollama(
+        [original_path, edited_path],
+        prompt,
+        config['ollama_model'],
+        config['ollama_server_url'],
+        config['ollama_api_key']
+    )
+    return critique
+
+def get_ai_refinement(original_path: str, edited_path: str, recommendations: dict, config: dict) -> tuple:
+    """
+    Get a critique and updated recommendations from AI to 'dial in' the image.
+    Returns: (refined_recs, critique)
+    """
+    logger.info(f"  Requesting AI refinement for {edited_path}...")
+    prompt = generate_refinement_prompt(recommendations)
+    response_text = send_images_to_ollama(
+        [original_path, edited_path],
+        prompt,
+        config['ollama_model'],
+        config['ollama_server_url'],
+        config['ollama_api_key']
+    )
+
+    try:
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            refined_recs = data.get("recommendations")
+            critique = data.get("critique", "No critique provided.")
+            
+            if refined_recs and validate_ai_response(refined_recs):
+                return refined_recs, critique
+            
+    except Exception as e:
+        logger.warning(f"  Failed to parse refinement JSON: {e}")
+
+    return None, response_text
 
 def main():
     """Main execution function"""
@@ -375,10 +476,7 @@ def main():
         os.makedirs(args.output_dir)
     
     # Get list of RAW files
-    raw_extensions = {'.cr2', '.cr3', '.crw', '.nef', '.orf', '.arw', '.mrw', 
-                      '.raf', '.rw2', '.dng', '.3fr', '.erf', '.kdc', '.mef', 
-                      '.pef', '.sr2', '.srw', '.tiff', '.tif'}
-    raw_files = [f for f in os.listdir(args.input_dir) if any(f.lower().endswith(ext) for ext in raw_extensions)]
+    raw_files = [f for f in os.listdir(args.input_dir) if any(f.lower().endswith(ext) for ext in RAW_EXTENSIONS)]
     
     if not raw_files:
         logger.info("No RAW files found to process")
@@ -396,49 +494,92 @@ def main():
         image_path = os.path.join(args.input_dir, raw_file)
         logger.info(f"Processing {raw_file}")
         
-        # Generate system prompt
-        prompt = generate_ai_prompt(image_path)
+        stem = Path(raw_file).stem
+        # Output files
+        metadata_file = os.path.join(args.output_dir, f"edit_{stem}.json")
+        output_file = os.path.join(args.output_dir, f"edit_{stem}.jpg")
+        pre_edit_file = os.path.join(args.output_dir, f"pre_{stem}.jpg")
         
-        # Send to Ollama for AI recommendations  
-        recommendations = send_image_to_ollama(
-            image_path, 
-            prompt, 
-            config['ollama_model'], 
-            config['ollama_server_url'], 
-            config['ollama_api_key']
-        )
+        # Save pre-edit version for comparison
+        try:
+            img = load_image(image_path)
+            save_processed_image(img, pre_edit_file)
+            logger.info(f"  Saved pre-edit image: {pre_edit_file}")
+        except Exception as e:
+            logger.error(f"  Failed to save pre-edit image for {raw_file}: {e}")
+            img = None
+
+        iterations_history = []
+        current_recs = None
+        best_recs = None
         
-        logger.info(f"  AI recommendations received")
+        # Iterative dial-in process (up to 3 rounds)
+        for round_num in range(1, 4):
+            logger.info(f"  Round {round_num}/3")
+            
+            if round_num == 1:
+                # Initial prompt and recommendations
+                prompt = generate_ai_prompt(image_path)
+                current_recs = send_image_to_ollama(
+                    image_path, 
+                    prompt, 
+                    config['ollama_model'], 
+                    config['ollama_server_url'], 
+                    config['ollama_api_key']
+                )
+                critique = "Initial recommendation pass."
+            else:
+                # Refinement: use previous result and recs to improve
+                if not os.path.exists(output_file):
+                    logger.warning(f"    No image from previous round. Skipping round {round_num}.")
+                    break
+                
+                refined_recs, critique = get_ai_refinement(
+                    image_path, output_file, current_recs, config
+                )
+                
+                if refined_recs:
+                    current_recs = refined_recs
+                else:
+                    logger.warning(f"    Failed to get valid refined recommendations in round {round_num}. Stopping iterations.")
+                    break
+
+            if not validate_ai_response(current_recs):
+                logger.warning(f"    Invalid AI response in round {round_num}. Skipping this pass.")
+                continue
+
+            # Apply recommendations to the original image
+            logger.info(f"    Applying edits for round {round_num}...")
+            try:
+                if img is None:
+                    img = load_image(image_path)
+                processed_img = apply_adjustments(img, current_recs)
+                save_processed_image(processed_img, output_file)
+                
+                best_recs = current_recs
+                iterations_history.append({
+                    "round": round_num,
+                    "recommendations": current_recs,
+                    "critique": critique
+                })
+                logger.info(f"    Saved image for round {round_num}")
+            except Exception as e:
+                logger.error(f"    Error applying adjustments in round {round_num}: {e}")
+                break
         
-        # Create output files (simulating actual processing)
-        metadata_file = os.path.join(args.output_dir, f"edit_{Path(raw_file).stem}.json")
-        output_file = os.path.join(args.output_dir, f"edit_{Path(raw_file).stem}.jpg")
-        
+        # Save final metadata with the history of the dial-in process
         metadata = {
             "original_image": raw_file,
             "processing_date": time.time(),
-            "recommendations": recommendations,
+            "final_recommendations": best_recs,
+            "iterations": iterations_history,
             "edit_series": f"edit_{Path(raw_file).stem}"
         }
-        
-        # Save metadata
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
         
-        # Process and save the actual image
-        if validate_ai_response(recommendations):
-            logger.info(f"  Applying AI edits to {raw_file}...")
-            img = load_raw_image(image_path)
-            processed_img = apply_adjustments(img, recommendations)
-            save_processed_image(processed_img, output_file)
-            logger.info(f"  Saved processed image: {output_file}")
-        else:
-            logger.warning(f"  Invalid AI response for {raw_file}. Skipping image processing.")
-            # Fallback to saving the original as-is or a simple copy if desired.
-            # For now, we just log the invalid response.
-        
-        logger.info(f"  Created: {output_file}")
-        logger.info(f"  Created: {metadata_file}")
+        logger.info(f"  Created final output: {output_file}")
+        logger.info(f"  Created final metadata: {metadata_file}")
 
 
     
