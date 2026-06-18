@@ -127,6 +127,7 @@ Provide recommendations for:
 4. Highlight recovery
 5. Shadow recovery
 6. Clarity/saturation
+7. Curves (point-based mapping)
 
 Format your response as valid JSON:
 {{
@@ -134,12 +135,14 @@ Format your response as valid JSON:
     "description": "Brief explanation of recommended edits",
     "edits": [
         {{
-            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
-            "value": "numeric or descriptive value",
+            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity|curves",
+            "value": "numeric value or JSON array for curves",
             "explanation": "Why this adjustment improves the image quality"
         }}
     ]
 }}
+Note: For 'curves', value should be a list of [input, output] pairs from 0.0 to 1.0, 
+e.g., [[0.0, 0.0], [0.25, 0.3], [0.75, 0.7], [1.0, 1.0]] to lift shadows and compress highlights.
 """
     return prompt
 
@@ -168,13 +171,14 @@ Format your response as valid JSON:
         "description": "Explanation of the refinements made",
         "edits": [
             {{
-                "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
-                "value": "numeric or descriptive value",
+                "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity|curves",
+                "value": "numeric value or JSON array for curves",
                 "explanation": "Why this updated value is better"
             }}
         ]
     }}
 }}
+Note: For 'curves', value should be a list of [input, output] pairs from 0.0 to 1.0.
 """
     return prompt
 
@@ -192,6 +196,7 @@ Provide recommendations for:
 4. Highlight recovery
 5. Shadow recovery
 6. Clarity/saturation
+7. Curves (point-based mapping)
 
 Format your response as valid JSON:
 {{
@@ -199,12 +204,13 @@ Format your response as valid JSON:
     "description": "Initial recommendations for image improvement",
     "edits": [
         {{
-            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
-            "value": "numeric or descriptive value",
+            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity|curves",
+            "value": "numeric value or JSON array for curves",
             "explanation": "Why this adjustment improves the image quality"
         }}
     ]
 }}
+Note: For 'curves', value should be a list of [input, output] pairs from 0.0 to 1.0.
 """
     else:
         prompt = f"""
@@ -220,12 +226,13 @@ Format your response as valid JSON:
     "description": "Refinements based on feedback: {user_feedback}",
     "edits": [
         {{
-            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
-            "value": "numeric or descriptive value",
+            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity|curves",
+            "value": "numeric value or JSON array for curves",
             "explanation": "How this change addresses the user's request"
         }}
     ]
 }}
+Note: For 'curves', value should be a list of [input, output] pairs from 0.0 to 1.0.
 """
     return prompt
 
@@ -374,6 +381,39 @@ def validate_ai_response(response: dict) -> bool:
             return False
     return True
 
+def interpolate_curve(points):
+    """
+    Create a 256-entry lookup table from a set of [input, output] points.
+    points: List of [x, y] where x, y are 0.0 to 1.0
+    """
+    # Ensure points are sorted by x
+    sorted_points = sorted(points, key=lambda p: p[0])
+    
+    # Add boundary points if not present
+    if not sorted_points or sorted_points[0][0] > 0:
+        sorted_points.insert(0, [0.0, sorted_points[0][1] if sorted_points else 0.0])
+    if sorted_points[-1][0] < 1.0:
+        sorted_points.append([1.0, sorted_points[-1][1] if sorted_points else 1.0])
+    
+    lut = []
+    for i in range(256):
+        x = i / 255.0
+        # Find the segment [p1, p2] that contains x
+        for j in range(len(sorted_points) - 1):
+            p1 = sorted_points[j]
+            p2 = sorted_points[j+1]
+            if p1[0] <= x <= p2[0]:
+                # Linear interpolation
+                t = (x - p1[0]) / (p2[0] - p1[0]) if p2[0] != p1[0] else 0
+                y = p1[1] + t * (p2[1] - p1[1])
+                lut.append(int(max(0, min(1, y)) * 255))
+                break
+        else:
+            # This should not happen if boundary points are added
+            lut.append(i)
+            
+    return lut
+
 def apply_adjustments(img: Image.Image, recommendations: dict) -> Image.Image:
     """Apply AI recommendations to the image using PIL ImageEnhance"""
     processed_img = img.copy()
@@ -384,6 +424,21 @@ def apply_adjustments(img: Image.Image, recommendations: dict) -> Image.Image:
         value = edit.get("value")
         
         try:
+            if edit_type == "curves":
+                # AI provides a list of [input, output] pairs
+                if isinstance(value, list):
+                    lut = interpolate_curve(value)
+                    # Apply to each channel
+                    if processed_img.mode == 'RGB':
+                        r, g, b = processed_img.split()
+                        r = r.point(lut)
+                        g = g.point(lut)
+                        b = b.point(lut)
+                        processed_img = Image.merge('RGB', (r, g, b))
+                    else:
+                        processed_img = processed_img.point(lut)
+                continue
+
             # Convert value to float if it's numeric
             if isinstance(value, str):
                 # Try to extract first float from string
@@ -416,9 +471,6 @@ def apply_adjustments(img: Image.Image, recommendations: dict) -> Image.Image:
                 factor = max(0.0, 1.0 + (numeric_value / 100.0))
                 enhancer = ImageEnhance.Contrast(processed_img)
                 processed_img = enhancer.enhance(factor)
-            # Other types (highlights, shadows, white_balance) would require 
-            # more complex numpy manipulations on the array.
-            
         except Exception as e:
             logger.warning(f"Could not apply edit {edit_type} with value {value}: {e}")
             
