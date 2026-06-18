@@ -178,24 +178,54 @@ Format your response as valid JSON:
 """
     return prompt
 
-def generate_critique_prompt(original_recommendations: dict) -> str:
-    """Generate prompt for AI to critique the results of edits"""
-    recs_text = json.dumps(original_recommendations, indent=2)
-    prompt = f"""
-You are an expert photo critic. You are provided with two images: 
-1. The original RAW image.
-2. The edited version based on specific recommendations.
+def generate_interactive_prompt(user_feedback: str, is_initial: bool = False) -> str:
+    """Generate a prompt for AI to suggest edits based on user feedback"""
+    if is_initial:
+        prompt = f"""
+You are an expert photo editor specializing in RAW image processing.
+Analyze this image and recommend initial adjustments to optimize it for viewing.
 
-The recommended edits were:
-{recs_text}
+Provide recommendations for:
+1. Exposure adjustment  
+2. White balance
+3. Contrast
+4. Highlight recovery
+5. Shadow recovery
+6. Clarity/saturation
 
-Please critique the edited image. 
-- Did the edits achieve the intended goal?
-- Is the image improved? 
-- Are there any over-corrections (e.g., too much saturation, too bright)?
-- What would you further improve?
+Format your response as valid JSON:
+{{
+    "title": "Initial AI Assessment",
+    "description": "Initial recommendations for image improvement",
+    "edits": [
+        {{
+            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
+            "value": "numeric or descriptive value",
+            "explanation": "Why this adjustment improves the image quality"
+        }}
+    ]
+}}
+"""
+    else:
+        prompt = f"""
+You are an expert photo editor. The user has reviewed the current edit and requested the following changes:
+"{user_feedback}"
 
-Provide a detailed, professional critique.
+Analyze the provided image and suggest specific adjustments to fulfill the user's request.
+Ensure your recommendations are complementary to the current look but move in the direction requested by the user.
+
+Format your response as valid JSON:
+{{
+    "title": "Interactive Refinement",
+    "description": "Refinements based on feedback: {user_feedback}",
+    "edits": [
+        {{
+            "type": "exposure|white_balance|contrast|highlights|shadows|saturation|clarity",
+            "value": "numeric or descriptive value",
+            "explanation": "How this change addresses the user's request"
+        }}
+    ]
+}}
 """
     return prompt
 
@@ -505,75 +535,95 @@ def main():
             img = load_image(image_path)
             save_processed_image(img, pre_edit_file)
             logger.info(f"  Saved pre-edit image: {pre_edit_file}")
+            current_img = img.copy()
         except Exception as e:
-            logger.error(f"  Failed to save pre-edit image for {raw_file}: {e}")
-            img = None
+            logger.error(f"  Failed to load image {raw_file}: {e}")
+            continue
 
         iterations_history = []
-        current_recs = None
-        best_recs = None
+        round_num = 1
         
-        # Iterative dial-in process (up to 3 rounds)
-        for round_num in range(1, 4):
-            logger.info(f"  Round {round_num}/3")
+        # Interactive dial-in process
+        while True:
+            logger.info(f"  Iteration {round_num}")
             
-            if round_num == 1:
-                # Initial prompt and recommendations
-                prompt = generate_ai_prompt(image_path)
-                current_recs = send_image_to_ollama(
-                    image_path, 
-                    prompt, 
-                    config['ollama_model'], 
-                    config['ollama_server_url'], 
-                    config['ollama_api_key']
-                )
-                critique = "Initial recommendation pass."
-            else:
-                # Refinement: use previous result and recs to improve
-                if not os.path.exists(output_file):
-                    logger.warning(f"    No image from previous round. Skipping round {round_num}.")
-                    break
-                
-                refined_recs, critique = get_ai_refinement(
-                    image_path, output_file, current_recs, config
-                )
-                
-                if refined_recs:
-                    current_recs = refined_recs
-                else:
-                    logger.warning(f"    Failed to get valid refined recommendations in round {round_num}. Stopping iterations.")
-                    break
-
-            if not validate_ai_response(current_recs):
-                logger.warning(f"    Invalid AI response in round {round_num}. Skipping this pass.")
-                continue
-
-            # Apply recommendations to the original image
-            logger.info(f"    Applying edits for round {round_num}...")
+            # Save current state for display and AI input
+            preview_path = os.path.join(args.output_dir, f"temp_preview_{stem}.jpg")
+            save_processed_image(current_img, preview_path)
+            
+            # Display the current image to the user
             try:
-                if img is None:
-                    img = load_image(image_path)
-                processed_img = apply_adjustments(img, current_recs)
-                save_processed_image(processed_img, output_file)
-                
-                best_recs = current_recs
+                current_img.show()
+            except Exception as e:
+                logger.warning(f"    Could not display image: {e}")
+            
+            # Get user feedback
+            user_feedback = input(f"  [{raw_file}] Enter stylistic changes/requests, or 'done' to finish: ").strip()
+            
+            if user_feedback.lower() == 'done':
+                logger.info(f"  User marked {raw_file} as done.")
+                break
+            
+            # AI recommendations based on feedback
+            is_initial = (round_num == 1)
+            prompt = generate_interactive_prompt(user_feedback, is_initial=is_initial)
+            
+            logger.info(f"    Requesting AI edits based on: {user_feedback if not is_initial else 'initial analysis'}...")
+            current_recs = send_image_to_ollama(
+                preview_path, 
+                prompt, 
+                config['ollama_model'], 
+                config['ollama_server_url'], 
+                config['ollama_api_key']
+            )
+            
+            if not validate_ai_response(current_recs):
+                logger.warning(f"    Invalid AI response in iteration {round_num}. Skipping this pass.")
                 iterations_history.append({
                     "round": round_num,
+                    "user_feedback": user_feedback,
                     "recommendations": current_recs,
-                    "critique": critique
+                    "status": "invalid_response"
                 })
-                logger.info(f"    Saved image for round {round_num}")
+                round_num += 1
+                continue
+
+            # Apply recommendations cumulatively
+            try:
+                current_img = apply_adjustments(current_img, current_recs)
+                save_processed_image(current_img, output_file)
+                
+                iterations_history.append({
+                    "round": round_num,
+                    "user_feedback": user_feedback,
+                    "recommendations": current_recs,
+                    "status": "applied"
+                })
+                logger.info(f"    Applied edits for iteration {round_num}")
             except Exception as e:
-                logger.error(f"    Error applying adjustments in round {round_num}: {e}")
-                break
+                logger.error(f"    Error applying adjustments in iteration {round_num}: {e}")
+                iterations_history.append({
+                    "round": round_num,
+                    "user_feedback": user_feedback,
+                    "recommendations": current_recs,
+                    "status": "error",
+                    "error": str(e)
+                })
+            
+            round_num += 1
         
-        # Save final metadata with the history of the dial-in process
+        # Cleanup temp preview
+        if os.path.exists(preview_path):
+            os.remove(preview_path)
+        
+        # Save final image and metadata
+        save_processed_image(current_img, output_file)
+        
         metadata = {
             "original_image": raw_file,
             "processing_date": time.time(),
-            "final_recommendations": best_recs,
             "iterations": iterations_history,
-            "edit_series": f"edit_{Path(raw_file).stem}"
+            "edit_series": f"edit_{stem}"
         }
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
